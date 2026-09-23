@@ -1,122 +1,42 @@
-# Darkly — Include (этап 3)
+# XSS Advanced — Writeup
 
-## 1. Механизм уязвимости (basic functioning)
+**Page:** `?page=media&src=...`
+**Flag:** `928d819fc19405ae09921a2b71227bd9aba106f9d2d37ac412e9e5a750f1506d`
 
-На главной странице сайта есть ссылка на просмотр картинки:
+## Mechanism
 
-```
-?page=media&src=nsa
-```
+The `media` page displays an image inside an `<object>` tag:
 
-Страница `media` работает так:
-
-1. Если значение параметра `src` совпадает с одним из «известных» имён
-   (например, `nsa`), сервер выводит готовую картинку из папки `images/`
-   (например, `images/nsa_prism.jpg`) внутри тега:
-   ```html
-   <object data="http://10.0.2.15/images/nsa_prism.jpg"></object>
-   ```
-2. Если значение `src` **не входит** в этот список — сервер переходит в
-   «резервную» ветку и вставляет присланное значение `src` **напрямую** в
-   атрибут `data="..."` тега `<object>`, без проверки того, что именно
-   пользователь туда передал.
-
-Тег `<object data="...">` — это стандартный HTML-тег для встраивания
-внешнего содержимого (картинки, документа, даже другого HTML-документа).
-Браузер интерпретирует значение `data` как URL и решает, как его
-отобразить, **в зависимости от схемы (scheme) этого URL**:
-`http://`, `https://`, `file://`, `data:` и т.д.
-
-Единственная защита, которую применяет сервер — это вырезание подстроки
-`http://` (без учёта регистра, одним проходом) из значения `src`. Это
-частично защищает от прямой подстановки внешнего HTTP-адреса
-(классический Remote File Inclusion), но **не защищает от других схем
-URL**.
-
-Схема **`data:`** позволяет закодировать целый HTML-документ (в том числе
-со скриптом) прямо внутри самого значения URL, в кодировке Base64:
-
-```
-data:text/html;base64,<Base64-строка с HTML/JS>
+```html
+<object data="http://10.0.2.15/images/nsa_prism.jpg"></object>
 ```
 
-Подставив такое значение в `src`, мы заставляем браузер отрендерить
-внутри `<object>` **собственный HTML-документ со скриптом**, который
-выполняется в контексте страницы сайта. Сервер, судя по всему,
-дополнительно детектирует сам факт присутствия такого payload'а (схема
-`data:` + `base64` + признаки исполняемого кода) и в этом случае
-немедленно выводит флаг прямо в HTML — без необходимости реального
-выполнения JS в браузере жертвы.
+If `src` matches a known name (e.g. `nsa`), it shows the built-in image. If not, the server drops into a fallback branch and inserts the raw `src` value directly into the `data="..."` attribute, without checking what it is.
 
-**Итоговый рабочий payload:**
+The browser reads `data` as a URL and renders it based on its **scheme** (`http://`, `data:`, etc.). The only filtering the server does is stripping the substring `http://` (case-insensitive, single pass). That blocks the obvious remote HTTP inclusion but nothing else. The `data:` scheme lets us embed a whole HTML document (with a script) inside the URL itself:
+
+```
+data:text/html;base64,<Base64 HTML/JS>
+```
+
+The browser renders that HTML inside `<object>`, executing our code in the page's context — a **XSS via injection into the `<object data>` attribute**.
+
+## Reproduction
+
 ```
 ?page=media&src=data:text/html;base64,PHNjcmlwdD5hbGVydChkb2N1bWVudC5jb29raWUpPC9zY3JpcHQ+
 ```
-(Base64 расшифровывается как `<script>alert(document.cookie)</script>`)
 
-Класс уязвимости, строго говоря — это **XSS через инъекцию в атрибут
-`data` тега `<object>`** (в терминологии проекта фигурирует как «Include»,
-поскольку картинка технически «инклюдится»/встраивается в страницу через
-управляемый параметр).
+The Base64 decodes to `<script>alert(document.cookie)</script>`. The server detects the payload and prints the flag directly in the HTML.
 
-## 2. Метод, который мог бы предотвратить эту уязвимость (fix)
+If a raw `http://` were needed, the single-pass filter is bypassed by nesting it inside itself: `htthttp://p://` → after one removal becomes `http://`.
 
-Проблема — в отсутствии контроля над тем, какие **схемы URL** допустимы
-для подстановки в `data`/`src`. Правильный фикс:
+## Flag comparison
 
-- **Строгий whitelist допустимых схем**: разрешать только `http://` и
-  `https://` (проверяя это явной проверкой префикса через регулярное
-  выражение `^https?://`, а не вырезанием подстроки).
-- **Отклонять, а не «чистить»** запрос целиком, если схема не входит в
-  whitelist (не пытаться «отфильтровать» плохую часть — сам факт
-  недопустимой схемы должен приводить к ошибке/дефолтному значению).
-- Дополнительно — не давать пользователю управлять `src` напрямую вообще:
-  вместо реального URL передавать **числовой ID**, по которому сервер сам
-  на своей стороне ищет соответствующий, заранее известный путь к файлу
-  в базе данных (list_images), и никогда не подставляет пользовательский
-  ввод в HTML-атрибут без экранирования и без валидации схемы.
-- Контентная политика безопасности (**CSP**, заголовок
-  `Content-Security-Policy: object-src 'none'`) на уровне сервера
-  дополнительно ограничила бы, что вообще может быть подставлено в
-  `<object>`, независимо от логики PHP-кода.
+Flag obtained through exploitation:
 
-## 3. Ущерб (impact), который может нанести эта уязвимость
-
-Это классический **XSS (Cross-Site Scripting)**, реализованный через
-управляемый атрибут `<object data="...">`:
-
-- Злоумышленник может создать ссылку с таким payload'ом и отправить её
-  жертве (фишинг) — при переходе по ссылке произвольный JS выполнится в
-  контексте сайта, от имени сессии жертвы.
-- Через `document.cookie` можно похитить cookies пользователя — в данном
-  случае это особенно критично, так как на сайте используется незащищённая
-  cookie `I_am_admin`, дающая прямой административный доступ (см. этап
-  Cookies) — то есть эта уязвимость может стать точкой входа для захвата
-  чужой сессии/прав.
-- Через `<object>` можно организовать скрытый редирект жертвы на
-  фишинговый сайт, подменяющий вид оригинальной страницы.
-- В более широком смысле — любое место, где сервер вставляет
-  пользовательский ввод в HTML без проверки схемы URL, открывает дорогу
-  для XSS через различные «нестандартные» векторы (`data:`,
-  `javascript:` и т.п.), которые часто не приходят в голову при
-  проектировании фильтров, ориентированных только на `http://`.
-
-## 4. Сравнение флагов
-
-**Флаг, полученный при эксплуатации:**
 ```
 928d819fc19405ae09921a2b71227bd9aba106f9d2d37ac412e9e5a750f1506d
 ```
 
-⚠️ Обрати внимание при демонстрации на защите: на самой странице флаг
-**визуально отображается заглавными буквами** (`THE FLAG IS : 928D819F...`)
-из-за CSS-стиля `text-transform: uppercase`, применённого ко всей
-странице (то же самое видно и в пунктах меню `HOME`/`SURVEY`/`MEMBERS`).
-**Настоящее** значение флага в HTML-коде страницы (View Page Source) —
-в нижнем регистре, как указано выше. Именно это значение нужно
-использовать при сравнении с флагом в файле `flag` в своей папке сдачи.
-
-**Файл флага** (`Include/flag`) должен содержать ровно:
-```
-928d819fc19405ae09921a2b71227bd9aba106f9d2d37ac412e9e5a750f1506d
-```
+Note: the page shows the flag in uppercase due to CSS `text-transform: uppercase`. The real value in the HTML source (View Page Source, Ctrl+U) is lowercase, as above — use that value when comparing with the `flag` file during the defense.

@@ -1,83 +1,41 @@
-# Darkly — Admin (htpasswd)
+# Admin (htpasswd) — Writeup
 
-## Метод обнаружения (How it was found)
+**Flag:** `d19b4823e0d5600ceed56d5e896ef328d7a2b9e7ac7e80f4fcdb9b10bcb3e7ff`
 
-1. Файл `robots.txt` (`http://<IP>/robots.txt`) содержал директиву `Disallow: /whatever`.
-   Сама директива `Disallow` в `robots.txt` предназначена для того, чтобы поисковые
-   роботы **не индексировали** путь — но файл публично читаем любым человеком, поэтому
-   на практике он часто просто **указывает атакующему**, что именно разработчик хотел
-   спрятать.
-2. Переход на `http://<IP>/whatever/` показал открытый листинг директории (Directory
-   Listing / Directory Indexing) — сервер не запретил вывод содержимого папки при
-   отсутствии `index`-файла в ней. В листинге был один файл: `htpasswd`.
-3. Файл `htpasswd` был открыт напрямую по адресу `http://<IP>/whatever/htpasswd` и
-   содержал одну строку:
+## Discovery method
+
+1. `http://<IP>/robots.txt` contains `Disallow: /whatever`. This directive is meant to keep search engines out, but the file is readable by anyone, so in practice it points an attacker straight at what the developer wanted to hide.
+2. `http://<IP>/whatever/` shows an open directory listing (the server did not disable indexing when no index file is present). It contains one file: `htpasswd`.
+3. `http://<IP>/whatever/htpasswd` contains a single line in the standard `login:hash` format used for HTTP Basic Auth:
+
    ```
    root:437394baff5aa33daa618be47b75cb49
    ```
-   Формат `login:hash` — стандартный формат файлов, которые Apache/nginx используют
-   для HTTP Basic Authentication.
-4. Хэш `437394baff5aa33daa618be47b75cb49` — 32 hex-символа, характерная длина для
-   **MD5**. Это нессоленый (без соли) MD5-хэш, что делает его уязвимым к словарному
-   перебору / поиску в готовых радужных таблицах.
-5. Хэш был проверен через публичный сервис подбора хэшей по словарю (CrackStation) —
-   найден пароль `qwerty123@`. Результат обязательно **перепроверен вручную**:
-   локально пересчитан MD5 от `qwerty123@` и сверен побайтово с исходным хэшем —
-   совпадение подтверждено (см. `Admin_htpasswd_explained.md`, шаг с командой
-   проверки).
-6. Учётные данные `root` / `qwerty123@` были опробованы на форме логина, найденной
-   по прямому пути `http://<IP>/admin/` (форма никак не связана видимой ссылкой
-   с остальным сайтом — классический пример "security through obscurity"). После
-   успешного входа сервер вернул флаг.
 
-## В чём проблема (потенциальная уязвимость)
+4. The hash is 32 hex characters — an unsalted MD5, which makes it easy to crack.
 
-Обнаруженная брешь — это комбинация нескольких классических ошибок конфигурации,
-каждая из которых сама по себе уже является уязвимостью:
+## Reproduction
 
-- **Открытый листинг директорий** — сервер не должен показывать содержимое папки,
-  если в ней нет `index`-файла и это не предполагается разработчиком.
-- **Файл с учётными данными доступен через веб-сервер** — файлы вроде `.htpasswd`
-  должны находиться вне корня, доступного через HTTP (`DocumentRoot`), либо быть
-  явно защищены правилами доступа на уровне сервера.
-- **Слабое хэширование пароля** — голый MD5 без соли взламывается практически
-  мгновенно при использовании простого/распространённого пароля.
-- **"Скрытая" страница администрирования без реальной защиты** — `/admin/` не
-  требует HTTP Basic Auth или иной серверной защиты; единственная "защита" —
-  отсутствие ссылки на эту страницу с сайта, что не является защитой.
-- **`robots.txt` как источник утечки информации** — файл, задуманный для
-  поисковых роботов, на практике облегчает разведку атакующему.
+1. Crack the MD5 hash → password `qwerty123@`. Verify by recomputing `MD5("qwerty123@")` locally and comparing byte-for-byte with the hash above.
+2. The login form lives at a direct path, `http://<IP>/admin/`, with no link from the rest of the site ("security through obscurity").
+3. Log in with `root` / `qwerty123@`. The server returns the flag.
 
-## Как этого можно было избежать (fix)
+## The problem
 
-1. Отключить листинг директорий на уровне веб-сервера:
-   - nginx: `autoindex off;`
-   - Apache: `Options -Indexes`
-2. Никогда не размещать файлы с учётными данными (`.htpasswd` и подобные) внутри
-   директории, доступной через HTTP. Если файл действительно нужен для Basic Auth,
-   он должен лежать **вне** `DocumentRoot`.
-3. Не полагаться на `robots.txt` как на средство сокрытия — это публичный файл;
-   для реального ограничения доступа нужны серверные правила доступа (аутентификация,
-   IP-ограничения и т.п.), а не соглашение с поисковыми роботами.
-4. Хэшировать пароли современными алгоритмами с солью и настраиваемой стоимостью
-   вычисления — bcrypt, argon2 или хотя бы PBKDF2, а не MD5/SHA1 без соли.
-5. Защищать административные разделы полноценной аутентификацией (HTTP Basic Auth
-   на уровне сервера, либо надёжная серверная сессия) — отсутствие ссылки на
-   странице не является защитой, только задержкой обнаружения.
+Several classic misconfigurations stacked together, each a vulnerability on its own:
 
-## Impact (потенциальный ущерб)
+- **Open directory listing** — the server exposes folder contents when no index file exists.
+- **Credentials file served over HTTP** — files like `htpasswd` should live outside the web root or be blocked by server rules.
+- **Weak hashing** — plain unsalted MD5 with a common password is cracked almost instantly.
+- **"Hidden" admin page with no real protection** — `/admin/` requires no server-side auth; the only "defense" is the absence of a link, which is not a defense.
+- **`robots.txt` as an information leak** — a file meant for crawlers hands the attacker a map of what to look at.
 
-Полный доступ к панели администрирования от имени пользователя `root` — в
-зависимости от функциональности панели это может означать полный контроль над
-содержимым сайта, доступ к данным пользователей, возможность дальнейшей
-эскалации привилегий на сервере в целом.
+## Flag comparison
 
-## Сравнение флагов
+Flag obtained through exploitation (`/admin/` after logging in as `root`/`qwerty123@`):
 
-| Источник | Значение |
-|---|---|
-| Флаг, полученный при эксплуатации (`http://<IP>/admin/` после входа `root`/`qwerty123@`) | `d19b4823e0d5600ceed56d5e896ef328d7a2b9e7ac7e80f4fcdb9b10bcb3e7ff` |
-| Эталонный флаг (сверяется во время защиты командой `cat {Breach name}/flag \| cat -e` из выданного экзаменатором окружения) | *сверяется вживую на защите* |
+```
+d19b4823e0d5600ceed56d5e896ef328d7a2b9e7ac7e80f4fcdb9b10bcb3e7ff
+```
 
-Оба значения должны совпадать побайтово — это демонстрируется экзаменатору
-напрямую в терминале во время защиты.
+Compared byte-for-byte with the `flag` file in the submission folder during the defense.

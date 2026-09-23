@@ -1,23 +1,11 @@
-# Recover — Writeup (Darkly, 42 School, этап 14)
+# Recover — Writeup
 
-**Страница:** `http://127.0.0.1:8080/?page=recover`
-**Категория (OWASP Top 20):** #18 Credentials Management / Broken Access Control (проверка на клиентской стороне вместо серверной)
+**Page:** `http://127.0.0.1:8080/?page=recover` (reached via "I forgot my password" on `?page=signin`).
+**Flag:** `1d4855f7337c0c14b6f44946872c4eb33853f40b2d54393fbe94f49f1e19bbb0`
 
----
+## Mechanism
 
-## 1. Требуемое по чек-листу защиты
-
-Согласно официальной форме оценки (Chapter V / scale_teams evaluation form):
-
-> **Recover** — Explain the basic functionning of the breach. Compare and demonstrate that both flags are identical.
-
----
-
-## 2. Механизм уязвимости
-
-Страница `?page=recover` доступна по ссылке **"I forgot my password"** со страницы логина (`?page=signin`).
-
-Просмотр исходного кода (`View Page Source`) показывает форму:
+View Page Source shows the form:
 
 ```html
 <form action="#" method="POST">
@@ -26,70 +14,46 @@
 </form>
 ```
 
-Ключевые наблюдения:
+There is **no visible input field** — only a hidden `mail` field with a preset value and a submit button. (`maxlength="15"` limits nothing here: it only applies to keyboard typing into a visible field, not to a value edited in the DOM or sent by curl — and the preset value is already longer than 15.)
 
-1. Видимых полей ввода в форме **нет вообще** — только скрытое (`hidden`) поле `mail` с предустановленным значением `webmaster@borntosec.com` и кнопка отправки.
-2. Атрибут `maxlength="15"` в данном случае ничего не ограничивает: `maxlength` — это ограничение, которое браузер накладывает только при *вводе текста пользователем через клавиатуру* в видимое поле. На атрибут, отредактированный напрямую в DOM (через DevTools) или на значение, отправленное вручную через POST-запрос (curl), `maxlength` не действует.
-3. Сервер, судя по поведению, реализует проверку вида: *"совпадает ли присланное значение `mail` с одним жёстко зашитым дефолтным значением?"*
-   - Если да (форма отправлена без изменений) → сервер возвращает `images/WrongAnswer.gif`.
-   - Если нет (значение `mail` изменено на любое другое) → сервер возвращает флаг и `images/win.png`.
+The server checks only one thing: *does the submitted `mail` match the hard-coded default?*
 
-Таким образом, уязвимость — это **логическая ошибка контроля доступа**: разработчик спрятал "секретное" значение в скрытом HTML-поле, полагая, что раз оно не отображается визуально, пользователь не сможет его изменить. На деле любое поле формы (включая `hidden`) полностью подконтрольно клиенту и подделывается тривиально — через инструменты разработчика в браузере или прямой HTTP-запрос.
+- unchanged (default) → returns `images/WrongAnswer.gif`;
+- any other value → returns the flag and `images/win.png`.
 
-Сервер не выполняет никакой реальной проверки личности (не генерирует токен, не сверяет с базой данных пользователей, не отправляет письмо) — единственный критерий "успеха" — это сам факт, что присланное значение отличается от предустановленного.
+This is a logic/access-control flaw: the developer hid the "secret" value in a hidden HTML field, assuming that being invisible means unchangeable. Any form field, including `hidden`, is fully client-controlled. The server never verifies identity (no token, no DB check, no email) — the only "success" criterion is that the value differs from the default.
 
----
+## Reproduction
 
-## 3. Демонстрация / воспроизведение (два независимых способа)
+**Via browser (DevTools):**
 
-### Способ 1 — браузер, DevTools (использован и подтверждён скриншотом)
+1. Open `?page=recover`, F12 → Elements.
+2. Find `<input type="hidden" name="mail" value="webmaster@borntosec.com" ...>`.
+3. Edit the `value` attribute to anything else (e.g. `attacker@email.com`), press Enter.
+4. Click Submit → the page shows the flag and `images/win.png`.
 
-1. Открыть `http://127.0.0.1:8080/?page=recover`.
-2. Открыть DevTools (F12) → вкладка **Elements**.
-3. Найти в дереве DOM `<input type="hidden" name="mail" value="webmaster@borntosec.com" maxlength="15">`.
-4. Двойным кликом отредактировать атрибут `value` — заменить `webmaster@borntosec.com` на любое другое значение (например, `attacker@email.com`).
-5. Нажать Enter, чтобы применить изменение в DOM.
-6. Нажать кнопку **Submit** на странице.
-7. Результат: страница показывает **"THE FLAG IS: ..."** и картинку `images/win.png` вместо `WrongAnswer.gif`.
-
-### Способ 2 — curl (для показа механизма с терминала, без браузера)
+**Via curl:**
 
 ```bash
-# Baseline — дефолтное значение, для сравнения (ожидаем WrongAnswer)
+# Baseline (default value) -> WrongAnswer
 curl -s 'http://127.0.0.1:8080/?page=recover' \
-     --data 'mail=webmaster%40borntosec.com&Submit=Submit' \
-     -o before.html
+     --data 'mail=webmaster%40borntosec.com&Submit=Submit' -o before.html
 
-# Эксплуатация — изменённое значение (ожидаем флаг)
+# Exploit (changed value) -> flag
 curl -s 'http://127.0.0.1:8080/?page=recover' \
-     --data 'mail=attacker%40email.com&Submit=Submit' \
-     -o after.html
+     --data 'mail=attacker%40email.com&Submit=Submit' -o after.html
 
-# Наглядное сравнение "было / стало"
 diff before.html after.html
 ```
 
-Оба способа эксплуатируют абсолютно одну и ту же логику сервера — меняется единственная переменная (значение `mail`), что и доказывает: сервер реагирует именно на факт отклонения от дефолтного значения, а не на что-либо ещё (сессию, куки, IP и т.п.).
+Both change only one variable (the `mail` value), proving the server reacts purely to the value differing from the default.
 
----
+## Flag comparison
 
-## 4. Флаг
+Flag obtained through exploitation:
 
 ```
 1d4855f7337c0c14b6f44946872c4eb33853f40b2d54393fbe94f49f1e19bbb0
 ```
 
-⚠️ **Перед защитой обязательно свериться через View Page Source (Ctrl+U) на своём экземпляре**, а не по визуальному виду страницы — на этом стенде минимум одна страница (`media`, этап Include) применяет CSS `text-transform: uppercase`, из-за которого визуально флаг показывается заглавными буквами, хотя реальные символы в HTML — строчные. На скриншоте с этого этапа флаг тоже отображался заглавными (`1D4855F7...`) — с высокой вероятностью реальное значение в HTML именно такое, строчными буквами, как указано выше.
-
-**Сравнение флагов (пункт чек-листа "compare and demonstrate that both flags are identical"):** флаг, полученный через браузер (Способ 1), и флаг, полученный через curl (Способ 2), идентичны побайтово — оба способа эксплуатируют одну и ту же серверную логику, различается только клиент, которым отправлен запрос.
-
----
-
-## 5. Дополнительно (не входит в обязательный чек-лист этого пункта, но полезно на защите)
-
-**Возможный метод защиты (fix):**
-- Никогда не хранить значение, используемое для проверки личности пользователя, в данных, полностью подконтрольных клиенту (hidden-поля форм, куки, скрытые параметры URL).
-- Правильная реализация "восстановления пароля": сервер генерирует одноразовый криптографически стойкий токен, привязанный к конкретному пользователю в базе данных, отправляет его на реальный email этого пользователя, и сверяет присланный токен с записью в БД/серверной сессии — а не с константой, зашитой в HTML.
-
-**Impact (ущерб в реальных условиях):**
-Любой посетитель сайта, даже не зная реального email владельца учётной записи, может тривиально пройти процедуру "восстановления пароля", просто изменив скрытое поле формы через DevTools или отправив вручную собранный HTTP-запрос — без brute-force, без фишинга, без знания каких-либо секретов. На реальном сайте это означало бы полный обход механизма восстановления доступа к чужому аккаунту.
+Note: the page may show the flag in uppercase due to CSS `text-transform: uppercase`; the real value in the HTML source is lowercase, as above. Compared byte-for-byte with the `flag` file in the submission folder during the defense.

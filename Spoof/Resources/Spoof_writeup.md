@@ -1,12 +1,25 @@
 # Spoof (curl) — Writeup
 
-## Флаг
+**Flag:** `f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188`
+
+## Mechanism
+
+There is a hidden footer link (`© BornToSec`) pointing to a hash-named page:
 
 ```
-f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188
+?page=b7e44c7a40c5f80139f0a50f3650fb2bd8d00b0d24667c4c2ca32c88e13b758f
 ```
 
-Получен через:
+Opened normally, the page shows nothing. HTML comments on `?page=survey` (visible only in View Page Source) give the hints:
+
+```html
+<!-- You must come from : "https://www.nsa.gov/". -->
+<!-- Let's use this browser : "ft_bornToSec". It will help you a lot. -->
+```
+
+The server checks two request headers — `Referer` and `User-Agent` — against fixed strings. Both headers are fully controlled by the client and are not verified in any way, so this is classic **HTTP header spoofing**: an access decision based on data the attacker can set freely. A browser sets these headers itself, so `curl` is used to send them explicitly.
+
+## Reproduction
 
 ```bash
 curl -H "Referer: https://www.nsa.gov/" \
@@ -14,75 +27,24 @@ curl -H "Referer: https://www.nsa.gov/" \
      "http://<IP>/index.php?page=b7e44c7a40c5f80139f0a50f3650fb2bd8d00b0d24667c4c2ca32c88e13b758f"
 ```
 
-> ⚠️ **Важное уточнение по итогам ревизии:** ранее этот флаг был
-> ошибочно записан как "побочная находка на footer-ссылке", а под
-> названием "Spoof" был записан флаг, идентичный флагу этапа **Cookies**
-> (`df2eb4ba...`, получаемый через тот же самый глобальный cookie
-> `I_am_admin` — это НЕ отдельный флаг, а повторное срабатывание уже
-> известного механизма Cookies). После сверки с двумя независимыми
-> внешними источниками (`tahsin5/darkly-2`, `owalid/darkly`) стало ясно,
-> что правильный механизм официального этапа "Spoof (curl)" — это именно
-> подмена HTTP-заголовков через curl, описанная в этом writeup'е.
+The server returns the flag.
 
-## Механизм уязвимости (кратко)
+## Fix
 
-На сайте есть скрытая ссылка в футере (`© BornToSec`), ведущая на
-страницу с именем-хэшем:
+- Do not use `Referer`/`User-Agent` as an access control. Both are client-controlled and prove nothing about where a request really came from.
+- To verify request origin, use server-side sessions with signed tokens (a CSRF token tied to the session), not string comparison of headers.
+- If these headers are used for analytics or soft checks, document that they are not a security control and never gate sensitive data or functions on them.
+
+## Benefit
+
+The attacker reaches a page that is meant to be reachable only "from a specific site with a specific browser" by sending two header lines. If a real system used this pattern to protect an API or an admin function, it would be bypassed with a single `curl` command — full access to something that was supposed to be restricted, with no credentials.
+
+## Flag comparison
+
+Flag obtained through exploitation:
+
 ```
-?page=b7e44c7a40c5f80139f0a50f3650fb2bd8d00b0d24667c4c2ca32c88e13b758f
+f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188
 ```
-При обычном обращении (без специальных заголовков) страница ничего не
-показывает. Однако в HTML-комментариях на странице `?page=survey`
-(видны только в View Page Source, не на визуальной странице) есть две
-подсказки:
-```html
-<!-- You must come from : "https://www.nsa.gov/". -->
-<!-- Let's use this browser : "ft_bornToSec". It will help you a lot. -->
-```
-Это прямое указание, что сервер проверяет два HTTP-заголовка запроса —
-`Referer` и `User-Agent` — и сравнивает их с конкретными,
-жёстко заданными строками. Заголовки полностью контролируются клиентом
-(браузером/curl) и никак не подтверждаются криптографически — то есть
-это классический пример **HTTP header spoofing**: сервер принимает
-решение об авторизации/доступе на основании данных, которые атакующий
-может подставить произвольно.
 
-Через обычный браузер подделать `Referer` и `User-Agent` неудобно
-(браузер сам их выставляет), поэтому по условию этапа ("Spoof (curl)")
-используется `curl`, который позволяет явно задать любые заголовки.
-
-## Способ защиты (fix)
-
-- **Не использовать `Referer`/`User-Agent` как механизм контроля
-  доступа.** Оба заголовка полностью контролируются клиентом и не могут
-  служить доказательством того, откуда "на самом деле" пришёл запрос.
-- Если нужна проверка происхождения запроса — использовать
-  server-side сессии с подписанными токенами (CSRF-токен, привязанный
-  к сессии на сервере), а не сравнение заголовков со строкой.
-- Если `Referer`/`User-Agent` используются для аналитики или мягких
-  проверок (не для авторизации) — явно документировать, что это не
-  security-контроль, и не завязывать на них доступ к чувствительным
-  данным/функциям.
-
-## Impact (какой ущерб это может нанести в реальности)
-
-- **Обход контроля доступа**: если реальная система использует
-  `Referer`/`User-Agent` для проверки "легитимности" запроса (например,
-  защита от прямого доступа к API, минуя фронтенд), это тривиально
-  обходится одной строкой `curl` — злоумышленник получает доступ к
-  функциям/данным, которые должны были быть защищены.
-- **Ложное чувство защищённости** у разработчиков: такая проверка
-  выглядит как барьер, но не создаёт реальной защиты — это "security
-  through obscurity", а не настоящий контроль доступа.
-- В сочетании с другими уязвимостями (например, если за такой проверкой
-  скрыт admin-функционал) — может привести к полному обходу
-  аутентификации.
-
-## Сравнение флагов
-
-| Источник | Значение |
-|---|---|
-| Флаг, полученный на VM (curl + Referer/User-Agent) | `f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188` |
-| Флаг из независимого публичного источника (`owalid/darkly`, запись "header") | `f2a29020ef3132e01dd61df97fd33ec8d7fcd1388cc9601e7db691d17d4d6188` |
-
-Флаги совпадают побайтово.
+Compared byte-for-byte with the `flag` file in the submission folder during the defense.

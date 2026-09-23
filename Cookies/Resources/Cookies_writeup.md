@@ -1,77 +1,45 @@
-# Darkly — Cookies (Breach writeup)
+# Cookies — Writeup
 
-## 1. Механизм уязвимости
+**Page:** `?page=admin` (a route inside `index.php`, not the physical `/admin/` directory).
+**Flag:** `df2eb4ba34ed059a1e3e89ff4dfc13445f104a1a52295214def1c4fb1693a5c3`
 
-Страница `?page=admin` (роут внутри `index.php`, не путать с физической
-директорией `/admin/`, решённой на этапе Admin/htpasswd) проверяет права
-администратора не через серверную сессию, а через значение **cookie**
-`I_am_admin`, которое полностью хранится и контролируется на стороне
-клиента.
+## Mechanism
 
-Найденное исходное значение cookie:
+The `?page=admin` route decides whether you are an admin from the value of a **cookie** (`I_am_admin`), which is stored and fully controlled on the client.
+
+The initial cookie value is:
+
 ```
 68934a3e9455fa72420237eb05902327
 ```
 
-Это MD5-хэш от строки `false` (32 hex-символа — характерная длина MD5).
-Сервер сравнивает пришедшую от клиента cookie с заранее вычисленными
-хэшами `MD5("true")` / `MD5("false")`, чтобы решить, показывать
-администраторский контент или нет.
+That is `MD5("false")`. The server compares the incoming cookie against precomputed `MD5("true")` / `MD5("false")` to show or hide admin content. Since the algorithm is public (MD5) and the input set is tiny and predictable (`true`/`false`), anyone can compute `MD5("true")` and set it themselves. The cookie is never signed or bound to a server-side session, so the server has no way to tell a forged value from a real one.
 
-Проблема: **алгоритм хэширования публичный (MD5), входные значения —
-предсказуемый и крайне ограниченный набор** (`true`/`false`). Ничто не
-мешает атакующему самому посчитать `MD5("true")` и подставить это
-значение в cookie напрямую через DevTools — без пароля, без сессии,
-без какого-либо взаимодействия с сервером. Сервер никак не подписывает
-и не проверяет подлинность/источник cookie (нет HMAC, нет привязки к
-server-side сессии).
+## Reproduction
 
-## 2. Эксплуатация — шаги
+1. Open `http://127.0.0.1:8080/?page=admin` — it returns 200 but shows a JS `alert("Wtf ?")` instead of content.
+2. DevTools → Application → Cookies → find `I_am_admin` = `68934a3e9455fa72420237eb05902327`.
+3. Compute `MD5("true")` = `b326b5062b2f0e69046810717534cb09`.
+4. Replace the cookie value with `b326b5062b2f0e69046810717534cb09`.
+5. Reload — the alert is gone and the flag is shown.
 
-1. Открыть `http://127.0.0.1:8080/?page=admin` — страница отвечает 200,
-   но показывает JS `alert("Wtf ?")` вместо контента.
-2. DevTools → Application → Cookies → найти `I_am_admin`, значение
-   `68934a3e9455fa72420237eb05902327`.
-3. Посчитать `MD5("true")` = `b326b5062b2f0e69046810717534cb09`.
-4. Заменить значение cookie на `b326b5062b2f0e69046810717534cb09`
-   вручную в DevTools.
-5. Обновить страницу — `alert` пропадает, отображается флаг.
+## Fix
 
-## 3. Как эту уязвимость можно было предотвратить (fix)
+- Do not store access rights on the client in a plain or easily computed form. Rights should be checked server-side via a session ID tied to server-stored session data.
+- If state must live in a cookie, use a signed or encrypted token (HMAC-SHA256 with a secret server key, or a JWT with signature verification), so the client cannot forge it even knowing the algorithm.
+- Do not use MD5 for authentication/integrity — it is fast and collision-prone; use HMAC with a secret key.
+- Set `HttpOnly` (and `Secure` where relevant) on such cookies to reduce theft via XSS.
 
-- **Не хранить признак прав доступа на клиенте в открытом/легко
-  вычислимом виде.** Права должны проверяться на сервере через
-  server-side сессию (session ID, привязанный к записи в серверном
-  хранилище сессий/БД), а не через значение, которое клиент может
-  свободно редактировать.
-- Если состояние всё же нужно держать в cookie — использовать
-  **подписанные/зашифрованные** токены (например, cookie с HMAC-подписью
-  на секретном серверном ключе, или JWT с проверкой подписи), чтобы
-  клиент не мог подделать значение, даже зная алгоритм.
-- Не использовать MD5 для проверки подлинности/целостности данных —
-  он быстрый, коллизионный и не предназначен для этой задачи; для
-  подписи нужен HMAC-SHA256 или аналог с секретным ключом.
-- Устанавливать на такие cookies флаги `HttpOnly` (не обязательно спасёт
-  от подмены через DevTools при физическом доступе, но исключает кражу
-  через XSS) и, где уместно, `Secure`.
+## Impact
 
-## 4. Impact (какой ущерб это может нанести)
+Any user with no credentials gets full access to the admin functionality just by editing one cookie — a complete bypass of authentication and authorization (Broken Access Control). In a real app this could mean access to the control panel, other users' data, content changes, user deletion, and so on. The root cause is a trust boundary violation: the server trusts data the client fully controls.
 
-Любой пользователь без учётных данных получает полный доступ к
-администраторскому функционалу приложения, просто отредактировав одну
-cookie в браузере — обход аутентификации и авторизации целиком. В
-реальном приложении это могло бы означать доступ к панели управления,
-чужим данным, возможность менять контент сайта, удалять пользователей
-и т.д. — классический пример "Broken Access Control" / "trust boundary
-violation": сервер доверяет данным, которые полностью контролирует
-клиент.
+## Flag comparison
 
-## 5. Сравнение флагов
+Flag obtained through exploitation:
 
-| | Значение |
-|---|---|
-| Флаг, полученный при эксплуатации | `df2eb4ba34ed059a1e3e89ff4dfc13445f104a1a52295214def1c4fb1693a5c3` |
-| Флаг для сравнения (эталонный, `{Breach}/flag` из сдачи) | — сверяется на защите/при сдаче |
+```
+df2eb4ba34ed059a1e3e89ff4dfc13445f104a1a52295214def1c4fb1693a5c3
+```
 
-Оба флага должны совпадать — это подтверждает, что уязвимость
-эксплуатирована корректно и до конца.
+Compared byte-for-byte with the `flag` file in the submission folder during the defense.

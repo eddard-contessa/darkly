@@ -1,123 +1,59 @@
-# File upload — writeup (для защиты)
+# File upload — Writeup
 
-## Флаг
+**Page:** `?page=upload` (form, `multipart/form-data`, method POST, field `uploaded`).
+**Flag:** `46910d9ce35b385885a9f7e2b336249d622f29b267a1771fbacf52133beddba8`
+
+## Mechanism
+
+The form claims to accept an "image", but the server decides whether to allow the upload based only on data the client fully controls:
+
+1. **The part's `Content-Type` header** inside the multipart request (the file part's type, not the whole HTTP request). If it looks like an image (`image/jpeg`, etc.), the server continues. If not (e.g. `application/octet-stream`), it rejects immediately with `Your image was not uploaded.`
+2. **The extension in `filename`.** If the name ends in `.php`, the server prints the flag.
+
+The server never looks at the **actual content** of the file (no magic bytes, no `getimagesize()`). Both checked values — `Content-Type` and `filename` — are just text fields the attacker sets freely.
+
+The submit field `Upload=Upload` (the name of `<input type="submit" name="Upload">`) is also required: without it the server does not react at all, even with a correct file and type.
+
+## Reproduction
+
+**Via curl** — text file, forged image `Content-Type`, `.php` extension:
+
+```bash
+curl -s "http://<IP>/index.php?page=upload" \
+  -F "uploaded=@shell.txt;filename=shell.php;type=image/jpeg" \
+  -F "Upload=Upload"
+```
+
+**Via fetch() + FormData in the browser console** (real session, DevTools → Sources → Snippets), building the file in memory with an explicit type since a plain `<input type="file">` cannot forge `Content-Type`:
+
+```javascript
+const f = new File(["<?php echo 'x'; ?>"], "shell.php", { type: "image/jpeg" });
+const fd = new FormData();
+fd.append("uploaded", f);
+fd.append("Upload", "Upload");
+fetch("/index.php?page=upload", { method: "POST", body: fd })
+  .then(r => r.text()).then(t => console.log(t));
+```
+
+Both return the same flag, which confirms the vulnerability is server-side and independent of the client.
+
+## Fix
+
+- **Validate file content server-side**, not client metadata. `getimagesize()` actually parses the file and returns `false` for a non-image, unlike `$_FILES['uploaded']['type']`, which is just the value the client sent.
+- **Ignore the client extension** when deciding how to handle the file, and use a strict whitelist of allowed formats rather than a blacklist (`.php`, `.phtml`, `.php5`, `.pht`, …).
+- **Store uploads outside any code-execution zone** — outside the web root, or with server config that forbids running scripts in the upload folder.
+- **Rename files on save** to a random server-chosen name with no client-controlled extension — this kills both the `filename` attack and any attempt to guess the stored path.
+
+## Impact
+
+Unrestricted file upload normally leads to **remote code execution**: upload PHP disguised as an image, then open it by URL and the server runs it. On this stand the chain stops at the last step — the server saves to `/tmp/{filename}` (a leaked absolute path), but `/tmp` is not web-accessible, so the shell cannot be reached by URL without a second vector. Still, bypassing the type check is a serious vulnerability on its own: it shows there is no server-side content validation, which in a different directory/config would give full RCE immediately.
+
+## Flag comparison
+
+Both techniques (curl and browser `fetch()`) return the byte-identical flag:
 
 ```
 46910d9ce35b385885a9f7e2b336249d622f29b267a1771fbacf52133beddba8
 ```
 
-Флаг снят двумя независимыми способами, давшими побайтово идентичный результат:
-1. Через `curl` (терминал, вне браузера).
-2. Через `fetch()` + `FormData` прямо в консоли браузера, с реальной пользовательской сессией.
-
-Оба способа приведены ниже — сравнение этих двух путей и есть требуемое
-"Compare and demonstrate that both flags are identical" (в данном случае
-это один и тот же флаг, полученный двумя разными техническими путями, что
-дополнительно подтверждает воспроизводимость эксплойта).
-
----
-
-## Механизм уязвимости (basic explanation)
-
-Страница `?page=upload` принимает файл через обычную HTML-форму
-(`multipart/form-data`, метод POST, поле `uploaded`). Форма визуально
-предлагается для загрузки "изображения", но сервер решает, разрешить ли
-загрузку, основываясь **только на данных, которые полностью контролирует
-клиент**, отправляющий запрос:
-
-1. **Заголовок `Content-Type` части файла** внутри multipart-запроса
-   (не заголовок всего HTTP-запроса, а именно той части, где лежит
-   содержимое файла). Если он похож на изображение (`image/jpeg` и
-   подобные) — сервер продолжает проверку. Если нет (например
-   `application/octet-stream`, который браузер сам подставляет для файлов
-   с "непонятным" расширением) — сервер сразу отклоняет с сообщением
-   `Your image was not uploaded.`, не проверяя ничего дальше.
-2. **Расширение в имени файла** (`filename` в multipart-запросе). Если имя
-   заканчивается на `.php` — сервер сам сообщает флаг прямо в HTML-ответе.
-
-**Ключевой момент:** сервер ни разу не заглядывает в **реальное
-содержимое** файла (не проверяет magic bytes, не пытается распознать файл
-как настоящее изображение через что-то вроде `getimagesize()`). Оба
-проверяемых параметра — `Content-Type` и `filename` — это просто текстовые
-поля запроса, которые атакующий указывает произвольно.
-
-Также обязательным условием срабатывания обработчика на сервере является
-наличие в запросе поля `Upload=Upload` (имя кнопки `<input type="submit"
-name="Upload">`) — без него сервер вообще не реагирует на запрос ни в
-каком виде (ни ошибкой, ни успехом), даже если файл и его тип корректны.
-Это стандартная защитная не-проверка "сервер ждёт конкретное имя поля
-сабмита формы", распространённая по всему стенду (аналогичное поведение
-уже встречалось на `?page=searchimg` с параметром `Submit=Submit`).
-
----
-
-## Как это можно было предотвратить (fix)
-
-- **Валидировать содержимое файла на сервере**, а не полагаться на
-  клиентские метаданные. Например, PHP-функция `getimagesize()` реально
-  парсит файл и возвращает `false`, если это не настоящее изображение —
-  в отличие от проверки `$_FILES['uploaded']['type']` (это ровно то
-  значение, которое отправляет браузер/клиент, и оно ничем не
-  подтверждается сервером).
-- **Игнорировать расширение из `filename` при определении, как
-  интерпретировать/выполнять файл.** Даже если расширение проверяется —
-  проверка "не заканчивается на `.php`" не защищает от других исполняемых
-  расширений (`.phtml`, `.php5`, `.pht` и т.п.), поэтому список разрешённых
-  форматов должен быть строгим whitelist'ом, а не blacklist'ом опасных
-  расширений.
-- **Хранить загруженные файлы вне зоны, доступной для выполнения кода**:
-  либо вне веб-корня совсем, либо с настройками веб-сервера, явно
-  запрещающими исполнение любых скриптов в папке загрузок (например,
-  `php_flag engine off` в `.htaccess` для Apache, или отдельный `location`
-  блок в nginx с `deny` на исполнение PHP).
-- **Переименовывать файл на сервере** при сохранении (случайное имя без
-  исходного расширения, определяемое сервером, а не клиентом) — это разом
-  устраняет и атаку через `filename`, и любые попытки угадать путь к
-  загруженному файлу.
-
----
-
-## Impact — какой ущерб это может нанести в реальности
-
-В классическом сценарии "unrestricted file upload" эта уязвимость обычно
-ведёт к **удалённому выполнению кода (RCE)**: атакующий загружает файл с
-PHP-кодом под видом картинки, а затем открывает его напрямую по URL —
-сервер выполняет код как обычный `.php`-скрипт, получая полный контроль
-над логикой приложения (чтение/запись файлов, доступ к базе данных,
-выполнение системных команд через что-то вроде `system($_GET['c'])`).
-
-**На этом конкретном стенде эта цепочка обрывается на последнем шаге**:
-сервер сообщает, что файл сохраняется в `/tmp/{имя файла}` (отдельно
-подтверждённая утечка абсолютного пути на файловой системе), но `/tmp` —
-это не веб-доступная директория, и nginx не отдаёт её содержимое по
-прямому URL. То есть загрузить шелл можно, но обратиться к нему через
-браузер напрямую нельзя без дополнительного вектора (например, отдельной
-LFI-уязвимости, которая умела бы прочитать/включить файл именно из `/tmp`
-— на момент этого этапа такой вектор на сайте не найден: единственный
-похожий по названию этап, "Include", на практике оказался client-side XSS,
-а не серверным `include()`).
-
-Тем не менее сама по себе возможность обойти проверку типа файла — это
-самостоятельная и серьёзная уязвимость, независимо от того, реализуется ли
-она прямо сейчас в полноценный RCE: она демонстрирует отсутствие
-server-side валидации содержимого, что в других конфигурациях (другая
-структура директорий, доступный `/tmp` через алиас, наличие иного способа
-исполнения загруженных файлов) немедленно даёт полный RCE.
-
----
-
-## Сравнение флагов (обе техники дают идентичный результат)
-
-**Через curl:**
-```
-The flag is : 46910d9ce35b385885a9f7e2b336249d622f29b267a1771fbacf52133beddba8
-```
-
-**Через fetch()+FormData в консоли браузера (реальная сессия):**
-```
-The flag is : 46910d9ce35b385885a9f7e2b336249d622f29b267a1771fbacf52133beddba8
-```
-
-Побайтовое совпадение — эксплойт полностью воспроизводим и не зависит от
-инструмента (curl vs браузер), что подтверждает, что уязвимость находится
-именно на сервере, а не является артефактом конкретного клиента.
+The same flag obtained two different ways satisfies "compare and demonstrate that both flags are identical" and confirms reproducibility. Compared byte-for-byte with the `flag` file in the submission folder during the defense.

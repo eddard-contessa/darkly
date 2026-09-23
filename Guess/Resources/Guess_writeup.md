@@ -1,134 +1,47 @@
 # Guess (hidden file) — Writeup
 
-> Формат ответа соответствует пунктам оценки из scale_teams (intra 42):
-> "Explain the research logic. Explain the benefit of this breach.
-> Compare and demonstrate that both flags are identical."
+**Flag:** `d5eec3ec36cf80dce44a896f961c1831a05526ec215693c8f2c39543497d4466`
 
----
+## Research logic
 
-## 1. Логика поиска (research logic)
+This is **information leakage through `robots.txt`** (security through obscurity). The developers listed the directories they wanted to hide from search engines in `robots.txt` — but that file is public, so instead of hiding those paths it reveals them.
 
-Уязвимость относится к категории **Information Leakage через `robots.txt`**
-(security through obscurity). Разработчики сайта захотели скрыть от
-поисковых систем определённые директории и явно перечислили их в файле
-`robots.txt` — но этот же файл общедоступен для любого посетителя сайта,
-и поэтому не скрывает, а наоборот **раскрывает** существование этих
-директорий.
-
-### Шаг 1 — обнаружение точки входа
-
-Запрос:
 ```
-GET /robots.txt HTTP/1.1
-```
-Ответ:
-```
+GET /robots.txt
 User-agent: *
 Disallow: /whatever
 Disallow: /.hidden
 ```
 
-Обе директивы `Disallow` прямо указывают на пути, которые администратор
-не хотел индексировать — то есть выдают их существование.
+Both `Disallow` entries point straight at paths the admin wanted hidden.
 
-### Шаг 2 — исследование `/.hidden/`
+## Reproduction
 
-Переход на `/.hidden/` показал открытый **directory listing** (autoindex
-nginx) — сервер настроен так, что при отсутствии индексного файла
-показывает список содержимого директории. Внутри — 26 папок со случайными
-именами (по одной на каждую первую букву алфавита a–z) и файл `README`.
+1. Open `/.hidden/` — the server shows an open directory listing (nginx autoindex). Inside are 26 folders (one per letter a–z) and a `README`.
+2. Every subfolder repeats the same structure: 26 folders + a `README`. It is a procedurally generated maze of tens of thousands of directories.
+3. Each `README` holds one of six joke lines in French (e.g. "Demande à ton voisin de droite", "Non ce n'est toujours pas bon ..."). Clicking through by hand is impossible.
+4. A small Python script (standard library + `requests`, no exploit tools) crawls the directories recursively, downloads every `README`, and compares their contents by text to find the one that differs from the jokes. Script attached in `Resources/darkly_hidden_crawler.py`.
+5. Of ~31,000 downloaded READMEs, six joke texts repeat 5000+ times each, while one text appears only twice:
 
-Открытие любой вложенной папки показывает точно такую же структуру:
-снова 26 папок + `README`. Это оказалось процедурно сгенерированным
-**лабиринтом** из нескольких уровней вложенности (глубина не
-фиксированная константа, а определяется самой структурой ответов
-сервера), общим числом в несколько десятков тысяч директорий.
+   ```
+   Hey, here is your flag : d5eec3ec36cf80dce44a896f961c1831a05526ec215693c8f2c39543497d4466
+   ```
 
-Содержимое `README` на каждом уровне — одна из шести шутливых фраз на
-французском (адресованных студенту, пытающемуся вручную кликать по
-папкам), например:
+   Path:
+   ```
+   /.hidden/whtccjokayshttvxycsvykxcfm/igeemtxnvexvxezqwntmzjltkt/lmpanswobhwcozdqixbowvbrhw/README
+   ```
 
-```
-Demande à ton voisin de droite
-Demande à ton voisin de gauche
-Demande à ton voisin du dessus
-Demande à ton voisin du dessous
-Tu veux de l'aide ? Moi aussi !
-Toujours pas tu vas craquer non ?
-Non ce n'est toujours pas bon ...
-```
+## Benefit
 
-Ручной перебор такого объёма папок физически невозможен, поэтому был
-написан скрипт на Python (без использования каких-либо
-эксплойт-инструментов, только стандартная библиотека + `requests`),
-который:
-1. Рекурсивно обходит директории через HTTP-запросы (тот же самый
-   `GET`, что делает браузер при клике по ссылке).
-2. Скачивает содержимое каждого найденного файла `README`.
-3. Сравнивает содержимое между собой (не по имени/размеру, а именно по
-   тексту), чтобы найти файл, отличающийся от типовых шуток-заглушек.
+Any file or directory left in the public web tree can be found and read by an outsider when the server serves it without an access check. Here the same `robots.txt` also exposed `/whatever/`, which held `htpasswd` (a login/password hash) — so one architectural mistake (publishing paths in `robots.txt` + open autoindex) leaks several kinds of sensitive data. In real systems open autoindex often exposes backups, config files and database dumps, so the real-world payoff is much larger than in this exercise.
 
-Полный текст скрипта приложен в `Resources/darkly_hidden_crawler.py`.
+## Flag comparison
 
-### Шаг 3 — обнаружение флага
+Flag obtained through exploitation:
 
-Из ~31 000 скачанных файлов `README` шесть текстов-заглушек повторялись
-по 5000+ раз каждый, а один текст встретился **всего 2 раза**:
-
-```
-Hey, here is your flag : d5eec3ec36cf80dce44a896f961c1831a05526ec215693c8f2c39543497d4466
-```
-
-Точный путь до найденного файла:
-```
-/.hidden/whtccjokayshttvxycsvykxcfm/igeemtxnvexvxezqwntmzjltkt/lmpanswobhwcozdqixbowvbrhw/README
-```
-
----
-
-## 2. Способ защиты (fix)
-
-- **Не полагаться на `robots.txt` как на механизм безопасности.** Он
-  предназначен только для управления поведением поисковых роботов, а не
-  для ограничения доступа. Любая директория, требующая защиты, должна
-  быть закрыта на уровне сервера (аутентификация, ACL, физическое
-  отсутствие в публичном веб-корне), а не просто "спрятана" через
-  `Disallow`.
-- **Отключить directory listing (autoindex) на nginx/Apache** для
-  директорий, где не предполагается публичный просмотр содержимого
-  (`autoindex off;` в конфигурации nginx). Именно открытый листинг
-  позволил обойти всю структуру без знания точных имён файлов.
-- Не размещать чувствительные данные в публично доступной части
-  файловой системы сайта в принципе — независимо от того, насколько
-  "случайным" кажется путь к ним.
-
----
-
-## 3. Ущерб (impact)
-
-- Информационная утечка (Information Disclosure): любой файл или
-  директория, случайно или намеренно оставленные в открытом доступе,
-  могут быть найдены и прочитаны посторонним, если сервер отдаёт их без
-  проверки прав.
-- В данном конкретном случае через тот же `robots.txt` была найдена и
-  вторая директория (`/whatever/`), в которой лежал файл `htpasswd` с
-  парой логин/хэш пароля — то есть один и тот же архитектурный просчёт
-  (публикация путей в `robots.txt` + открытый autoindex) может привести
-  к утечке сразу нескольких типов чувствительных данных.
-- В реальных системах открытый autoindex часто раскрывает резервные
-  копии, конфигурационные файлы, дампы баз данных и т.п. — то есть
-  потенциальный ущерб значительно выше, чем в учебном примере.
-
----
-
-## 4. Сравнение флагов
-
-**Флаг, полученный через эксплуатацию:**
 ```
 d5eec3ec36cf80dce44a896f961c1831a05526ec215693c8f2c39543497d4466
 ```
 
-**Флаг из официального `flag`-файла (для сравнения на защите):**
-_(вставить содержимое `Guess/flag` — идентично найденному выше)_
-
-Оба значения совпадают.
+Compared byte-for-byte with the `flag` file in the submission folder during the defense.

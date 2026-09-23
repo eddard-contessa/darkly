@@ -1,95 +1,34 @@
-# Darkly — Redirect (writeup)
+# Redirect — Writeup
 
-## 1. Механизм уязвимости
+**Flag:** `b9e775a0291fed784a2d9680fcfad7edd6b8cdf87648da647aaf4bba288bcab3`
 
-Сайт предоставляет функцию перехода на страницы соцсетей через маршрут:
+## Mechanism
+
+The site offers social-media links through the route:
 
 ```
-index.php?page=redirect&site=<название>
+index.php?page=redirect&site=<name>
 ```
 
-Иконки Facebook / Twitter / Instagram в подвале сайта ссылаются именно на этот
-маршрут с параметром `site`, равным `facebook`, `twitter` или `instagram`
-соответственно. Бэкенд принимает значение параметра `site` **без проверки
-по белому списку** и подставляет его в HTTP-редирект (заголовок ответа
-`Location`).
+The Facebook / Twitter / Instagram footer icons use this route with `site` set to `facebook`, `twitter` or `instagram`. The backend takes `site` **without any whitelist check** and uses it as the redirect target (`Location` header).
 
-Проверка это подтвердила:
+This is a classic **Open Redirect**: the link visibly starts with the trusted Darkly domain but sends the user wherever the `site` parameter points.
 
-- Запрос `?page=redirect&site=facebook` → сервер отвечает **302 Moved
-  Temporarily** и уводит браузер на реальный `facebook.com`.
-- Запрос `?page=redirect&site=https://example.com` (произвольный, не
-  предусмотренный сайтом адрес) → сервер обрабатывает его иначе, но сам факт,
-  что параметр `site` принимает **любое** значение и определяет пункт
-  назначения, подтверждает: сервер не ограничивает редирект заранее
-  известным набором доменов.
+## Reproduction
 
-Это классическая уязвимость **Open Redirect** (OWASP: URL Redirection to
-Untrusted Site). Суть: ссылка визуально начинается с доверенного домена
-(домен сайта Darkly), но фактически уводит пользователя на произвольный
-внешний адрес, который указывает атакующий.
+```
+?page=redirect&site=facebook          -> 302 Moved Temporarily, redirects to real facebook.com
+?page=redirect&site=https://example.com  -> 200, flag printed in the HTML
+```
 
-## 2. Сравнение флагов
+A known value produces a real redirect; any value outside the expected set is handled differently and returns the flag directly in the page, confirming the parameter is not restricted to a fixed set of domains.
 
-Флаг, полученный при эксплуатации (значение при непредусмотренном значении
-параметра `site`):
+## Flag comparison
+
+Flag obtained through exploitation (unexpected `site` value):
 
 ```
 b9e775a0291fed784a2d9680fcfad7edd6b8cdf87648da647aaf4bba288bcab3
 ```
 
-Флаг совпадает с эталонным значением, выданным на странице сайта после
-успешной эксплуатации (см. `Resources/`).
-
-## 3. Способ защиты (fix)
-
-Вместо прямой подстановки значения параметра `site` в редирект нужно
-использовать **белый список** (whitelist) допустимых пунктов назначения на
-стороне сервера, например:
-
-```php
-$allowed = [
-    'facebook'  => 'https://facebook.com/42born2code/',
-    'twitter'   => 'https://twitter.com/42born2code/',
-    'instagram' => 'https://instagram.com/42born2code/',
-];
-
-if (isset($allowed[$_GET['site']])) {
-    header('Location: ' . $allowed[$_GET['site']]);
-    exit;
-}
-
-// значение не найдено в белом списке — не редиректим никуда,
-// показываем ошибку или редиректим на свою же страницу 404
-header('Location: /');
-exit;
-```
-
-Ключевой принцип: **никогда не доверять пользовательскому вводу как
-адресу назначения**. Разрешён только явно перечисленный набор значений;
-всё остальное отклоняется.
-
-## 4. Потенциальный ущерб (impact)
-
-- **Фишинг.** Атакующий рассылает ссылку вида
-  `https://borntosecweb.<домен>/?page=redirect&site=https://zlojsite.example`.
-  Жертва видит в начале адресной строки знакомый доверенный домен и с большей
-  вероятностью переходит по ссылке, реально попадая на поддельную страницу
-  (например, копию формы логина), где вводит свои данные.
-- **Обход спам/антифишинг-фильтров.** Многие email- и антивирусные фильтры
-  проверяют репутацию домена в начале ссылки; открытый редирект позволяет
-  «спрятать» вредоносный адрес за доверенным доменом и обойти такую
-  проверку.
-- **Кража токенов авторизации.** Если механизм редиректа используется в
-  потоках вида OAuth (`redirect_uri`), открытый редирект может позволить
-  перехватить токен доступа, отправив его на контролируемый атакующим
-  сервер вместо легитимного.
-
-## 5. Материалы
-
-См. папку `Resources/`:
-- `redirect_302_facebook.png` — скриншот запроса `site=facebook` со статусом
-  302 и переходом на реальный facebook.com.
-- `redirect_flag.png` — скриншот запроса `site=https://example.com` со
-  статусом 200 и флагом на странице.
-- `payloads.txt` — список использованных URL/команд.
+Compared byte-for-byte with the `flag` file in the submission folder during the defense.

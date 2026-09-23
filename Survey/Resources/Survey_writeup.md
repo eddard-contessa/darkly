@@ -1,85 +1,46 @@
 # Survey — Writeup
 
-## Флаг
+**Page:** `index.php?page=survey` (voting form, method POST).
+**Flag:** `03a944b434d5baff05f46c4bede5792551a2595574bcafc9a6e25f67c382ccaa`
 
-```
-03a944b434d5baff05f46c4bede5792551a2595574bcafc9a6e25f67c382ccaa
-```
+## Discovery technique
 
-## Точка входа
+The form has two parameters:
 
-`index.php?page=survey` — форма голосования за темы (Subject). Метод POST,
-два параметра:
-- `sujet` — hidden-поле, id темы (в интерфейсе видно 2–6)
-- `valeur` — `<select>` с вариантами **1–10**, форма отправляется
-  автоматически при выборе значения (`onChange`)
+- `sujet` — hidden field, the subject id (2–6 in the interface);
+- `valeur` — a `<select>` offering values **1–10**, auto-submitted on change (`onChange`).
 
-## Механизм уязвимости
+The `<select>` only *visually* limits the choice to 1–10. That is a browser-side restriction — nothing stops us from sending a POST request directly (curl) with any `valeur`. Testing the range showed the server does not actually enforce 1–10:
 
-Уязвимость — **Improper Input Validation (недостаточная серверная проверка
-значения, ограниченного только на уровне клиентского HTML)**.
+- `valeur` 0–10 → processed as a normal vote (average and vote count update);
+- `valeur` > 10 (11, 15, 100, …) → the server treats it as an unexpected value and prints the flag instead of counting the vote;
+- non-numeric/compound values (`5'`, `5 or 1=1`, `valeur[]=5`, missing param) → silently rejected, no flag, no SQL error;
+- `sujet` is forced to an integer server-side (`intval()`-style), so no SQL injection through it.
 
-На странице `<select>` физически предлагает пользователю только 10
-вариантов — от 1 до 10. Разработчик рассчитывал, что раз в интерфейсе
-нельзя выбрать что-то другое, то и на сервер придёт только число 1–10.
-Но HTML `<select>` — это чисто визуальное ограничение браузера: ничто не
-мешает отправить POST-запрос напрямую (curl, Postman, изменённый JS),
-минуя интерфейс, и указать в `valeur` любое значение.
+This is **improper input validation** — the server trusts that the value is limited by the HTML `<select>` and never rechecks it.
 
-На сервере проверка диапазона **фактически не соответствует** заявленному
-диапазону 1–10:
-- Значения **0–10** — обрабатываются как обычный (валидный) голос: сумма
-  оценок и счётчик голосов пересчитываются нормально.
-- Значения **>10** (11, 15, 100, 10000 и т.д. — проверено) — сервер
-  распознаёт это как "неожиданное" значение и **вместо обычной обработки
-  голоса** выводит текст с флагом. Голос при этом не засчитывается
-  (счётчик и средний балл не меняются).
-- Нечисловые/составные значения (`5'`, `5 or 1=1`, `valeur[]=5`,
-  отсутствие параметра) — тихо отклоняются без флага и без ошибки; SQL-
-  инъекции через `valeur` не подтверждено.
-- Параметр `sujet` — жёстко приводится к целому числу на сервере
-  (аналог `intval()`), весь текст после первой цифры отбрасывается;
-  SQL-инъекция через `sujet` невозможна (проверено, включая HEX-обход).
-
-## Как воспроизвести (рабочий payload)
+## Reproduction
 
 ```bash
 curl -s "http://127.0.0.1:8080/index.php?page=survey" --data "sujet=2&valeur=100"
 ```
 
-Минимальный рабочий вариант — любое `sujet` из существующих (2–6) и любое
-`valeur` строго больше 10 (проверено: 11, 15, 100 — все дают флаг):
+Minimal working payload — any existing `sujet` (2–6) and any `valeur` strictly greater than 10:
 
 ```bash
 curl -s "http://127.0.0.1:8080/index.php?page=survey" --data "sujet=3&valeur=11"
 ```
 
-## Способ защиты (fix)
+## Impact
 
-Проверять значение `valeur` на сервере по строгому белому списку/диапазону,
-совпадающему с реальным бизнес-правилом, **не полагаясь** на то, что
-пользователь физически ограничен HTML-элементом `<select>`:
+Here the direct effect is skewing public voting statistics — an integrity issue more than a direct breach. But the same class of flaw (server trusting an HTML-limited value without rechecking) can be far worse in other contexts: tampering with a product price or quantity in an order, bypassing business limits (attempt counts, discount size), or DoS by feeding extreme values into calculations.
 
-```php
-$valeur = (int)$_POST['valeur'];
-if (!in_array($valeur, range(1, 10), true)) {
-    // отклонить запрос, ничего не менять в базе
-    die("Invalid vote value");
-}
+## Flag comparison
+
+Flag obtained through exploitation:
+
+```
+03a944b434d5baff05f46c4bede5792551a2595574bcafc9a6e25f67c382ccaa
 ```
 
-Общий принцип: любые ограничения, показанные только в интерфейсе
-(`<select>`, `maxlength`, `disabled` и т.п.), должны быть **продублированы**
-проверкой на сервере — клиентская часть контролируется атакующим
-полностью и не может считаться источником доверенных данных.
-
-## Impact (потенциальный ущерб)
-
-В данном конкретном случае — искажение публичной статистики (средний
-балл голосования), что скорее вопрос целостности данных (Integrity), чем
-прямая угроза безопасности. Но тот же класс уязвимости (сервер доверяет,
-что значение ограничено HTML-интерфейсом, и не перепроверяет это) в
-других контекстах может привести к куда более серьёзным последствиям:
-подмена цены/количества товара в заказе, обход бизнес-лимитов (например,
-количество попыток, размер скидки), либо DoS через передачу экстремальных
-значений в расчёты, вызывающих переполнение или падение сервиса.
+Compared byte-for-byte with the `flag` file in the submission folder during the defense.
