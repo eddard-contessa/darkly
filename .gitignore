@@ -1,0 +1,9 @@
+# OS files
+.DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# vm
+Darkly_i386.iso
