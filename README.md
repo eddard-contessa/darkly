@@ -1,14 +1,9 @@
 <img title="42_Darkly" alt="42_Darkly" src="./subject/banner.png" width="100%">
-<!-- 
+
 |           Grade          |                           |
 |:------------------------:|:-------------------------:|
 | ![](./subject/grade.png) | ![](./subject/detail.png) |
-  -->
-<br>
 
----
-
-<br>
 
 ---
 
